@@ -1,0 +1,2330 @@
+import re, datetime, sys, os, glob, platform, subprocess, time, statistics
+from datetime import timedelta
+from multiprocessing import Process, Queue
+from fractions import Fraction
+from openpyxl import Workbook, load_workbook
+
+
+"""
+NOTE FROM 2022/06/12: (everything else here aside from this, notes and code, was written before April 2021) 
+  This is not the project that will be the consciousness project the README article is about. But I will be using
+   a lot from this project. The future project wont be about Work Tracking and Active Leisure Tracking, those two 
+   things will be merged into Habit Tracking. It will be very similar, but I'll ditch the points system, although
+   retain the tracking of consecutive days, and the balance ratings. I do presently use this program, but if you
+   want to try it realize it's only designed to run in a Python shell (and last I tried to use it on a Mac it 
+   had a bug, so right now only PC usable). If you're really interested in trying it let me know and I can
+   walk you through it. Peace!
+
+
+"""
+
+
+
+class LWT:
+
+    def __init__(self, filename=None, goals_filename=None):
+        #work and al project lists are lists of filepaths (altracking.xlsx and wtracking.xlsx)
+        self.filename = filename
+        self.work_project_list = []
+        self.al_project_list = []
+
+        #the following lets switch_options() choice 2 call for the info_set to run again later
+        self.reset_info = False
+
+        #contains number of minutes for each session. default is 'run' which just runs a clock until user hits enter
+        self.workminutes = 'run'
+        self.breakminutes = 'run'
+
+        #these are the values entered into the spreadsheet
+        self.shift_start_time = datetime.datetime.now()
+        self.entry_work_type = ''
+        self.entry_info_diary_notes = ''
+        self.entry_work_duration = 0
+
+        #for max row in a sheet found in length()
+        self.sheet_length = 0
+
+        #for turning minutes into hrs mins in hrs()
+        self.duration_hrs_mins = '0mins'
+        self.work_alarm_file_path = ''
+        self.break_alarm_file_path = ''
+
+        #for when a list of the current weeks days and last week's week days are created by create_this_week_dtos()
+        self.this_week_dtos = []
+        self.last_week_dtos = []
+
+        #these get populated with the current timesums for each of the goal worktypes for last
+        self.day_goal_timesums = {'active-leisure': 0, 'work': 0}
+        self.week_goal_timesums = {'active-leisure': 0, 'work': 0}
+        self.day_timesums = {'active-leisure': 0, 'work': 0}
+        self.week_timesums = {'active-leisure': 0, 'work': 0}
+
+
+        #create_raw_data_for_status() populates this with spreadsheet data for each shift this week and last week
+        self.raw_data_for_status = []
+
+        #the following reports this week and today balance ratings
+        # {'work type': [today balance rating, this week balance rating]}
+        self.week_worktype_balance_ratings = {}
+        self.today_worktype_balance_ratings = {}
+        self.week_project_type_balance_ratings = {'active-leisure': 0, 'work': 0}
+        self.today_project_type_balance_ratings = {'active-leisure': 0, 'work': 0}
+        self.points_dict = {}
+
+        #the following holds overall timesums, al means active leisure
+        self.al_today_timesum = 0
+        self.work_today_timesum = 0
+        self.al_week_timesum = 0
+        self.work_week_timesum = 0
+
+        #the following are for project time stats and
+        # and display strings of timesums for each project in the respective list above
+        self.work_projects_times = []
+        self.al_projects_times = []
+        self.work_projects_times_display = []
+        self.al_projects_times_display = []
+
+        """
+        the following block of lines, ending with another note like this, are for preferences settings.
+        """
+        #this dictionary is for {'worktype': [day-goal, week-goal]}
+        #EDIT: needs to become part of the database, probably good to save changes over time
+        self.worktypes_for_goals =  {
+                                    'python': [0, 360], 'reading': [60, 420], 'french': [40, 280],
+                                    'chinese': [40, 280], 'meditation': [60, 420], 'sport': [60, 420],
+                                    'editing': [120, 840], 'writing': [120, 840], 'house': [0, 180]
+                                    }
+        #this dictionary is for {'project type': [day-goal, week-goal]}
+        self.project_types_for_goals = {'active-leisure': [1, 1], 'work': [1, 1]}
+        #these are all used in create_points_stats(). The first four are integers that divide into
+        # timesums to find multiplier points as the sum approaches a goal.
+        self.worktype_day_goal_points_divider = 20
+        self.worktype_week_goal_points_divider = 60
+        self.project_type_day_goal_points_divider = 60
+        self.project_type_week_goal_points_divider = 240
+        #this integer is the max number of points the session_points_divider can create when divided into
+        # the session timesum.
+        self.session_max_multiplier = 6
+        #this one is in create_raw_data_for_status(), and it's the integer that's divided into the timesum
+        # to determine where in a session the user is. This number combined with session_max_multiplier above
+        # sets the length of a session (right now 6*20=2hrs)
+        self.session_points_divider = 30
+        # this is used in create_raw_data_for_status(), and it's the integer that's the max multiplier created
+        # by consecutive days in a worktype, right now set to 4 days.
+        self.max_consecutive_day_multiplier = 4
+        """
+        this ends the block of lines for preferences settings.
+        """
+
+
+    """
+    This method runs select() and alarm() to get the required files, then
+    runs work(), because these are always the first thing I run
+    """
+
+    def start(self):
+
+        self.select()
+        self.alarm()
+        self.info_set()
+        self.work()
+
+
+    """
+    This method starts the session with a break instead of work.
+    """
+
+    def break_start(self):
+
+        self.shift_start_time = datetime.datetime.now()
+        self.runtime_options('break')
+        self.work()
+
+
+    """
+    select() does a lot because it takes the selection but also presents a lot of info
+    """
+
+    def select(self):
+
+        #all for lists of file paths
+        file_list = []
+        self.work_project_list = []
+        self.al_project_list = []
+
+        #this gets all xlsx files with the name wtracking or altracking (active leisure tracking)
+        for file in glob.iglob('**/*.xlsx', recursive=True):
+            file_list.append(file)
+        for x in file_list:
+            if re.search('wtracking', x, re.IGNORECASE):
+                self.work_project_list.append(x)
+            if re.search('altracking', x, re.IGNORECASE):
+                self.al_project_list.append(x)
+
+        # this creates timesums for all projects to display with them
+        self.create_base_stats()
+
+        #the adjustment is for listing two sets of filepaths as one. The first set uses
+        # the actual key as its display number, but the second uses the key plus key adjust
+        key_adjust = len(self.work_project_list)
+
+        #lists work projects with their timesums
+        for key, value in enumerate(self.work_project_list):
+            print('\n')
+            print('work: ' + value + ': ' + str(key))
+            if len(self.work_projects_times_display) > 0:
+                print(self.work_projects_times_display[key])
+
+        #lists active leisure projects with their timesums
+        for key, value in enumerate(self.al_project_list):
+            key_adjusted = key + key_adjust
+            print('\n')
+            print('active leisure: ' + value + ': ' + str(key_adjusted))
+            if len(self.al_projects_times_display) > 0:
+                print(self.al_projects_times_display[key])
+
+        #the input is the actual key of the fils
+        print('\nenter the number for the tracking file\n')
+        user_input = input()
+        project_index = int(user_input)
+        if project_index > len(self.work_project_list) - 1:
+            self.filename = self.al_project_list[(project_index - key_adjust)]
+        else:
+            self.filename = self.work_project_list[project_index]
+
+
+    """
+    This presents all mp3 files and stores the selection in self.alarm_file_path
+    """
+
+    def alarm(self):
+
+        #will be populated with all mp3 files
+        file_list = []
+
+        #searches all subdirectories from the waalt folder for mp3 files
+        for file in glob.iglob('**/*.mp3', recursive=True):
+            file_list.append(file)
+
+        #displays the files and allows selection of one for break alarm and work alarm
+        for key, value in enumerate(file_list):
+            print(value + ': ' + str(key))
+        print('\nselect the work-timer alarm file by entering a number\n')
+        user_input = input()
+        try:
+            file_index = int(user_input)
+            self.work_alarm_file_path = file_list[file_index]
+        except:
+            self.work_alarm_file_path = None
+        print('\nselect break-timer alarm file by entering a number\n')
+        user_input = input()
+        try:
+            file_index = int(user_input)
+            self.break_alarm_file_path = file_list[file_index]
+        except:
+            self.break_alarm_file_path = None
+
+    """
+    This method plays the alarm in a separate thread, so that I can turn off the alarm
+    by closing the thread.
+    """
+
+    def alarm_play(self, *args):
+
+        #runs the alarm for work timer
+        if 'work' in args:
+            if self.work_alarm_file_path == None:
+                pass
+            else:
+                if platform.system() == 'Windows':
+                    #for windows
+                    os.startfile(self.work_alarm_file_path)
+                elif platform.system() == 'Darwin':
+                    #for mac
+                    subprocess.run(['open', self.work_alarm_file_path])
+                    sys.stdout.write('\b\b\b\b\b')
+                else:
+                    #for Linux
+                    subprocess.call(('xdg-open', self.work_alarm_file_path))
+
+        #runs the alarm for break timer
+        if 'break' in args:
+            if self.break_alarm_file_path == None:
+                pass
+            else:
+                if platform.system() == 'Windows':
+                    #for windows
+                    os.startfile(self.break_alarm_file_path)
+                elif platform.system() == 'Darwin':
+                    #for mac
+                    subprocess.run(['open', self.break_alarm_file_path])
+                    sys.stdout.write('\b\b\b\b\b')
+                else:
+                    #for Linux
+                    subprocess.call(('xdg-open', self.break_alarm_file_path))
+
+    """
+    turns a total minutes into a string for displaying hrs and minutes
+    """
+
+    def hrs(self, minutes):
+
+        duration_hrs_str = str(minutes//60)
+        if duration_hrs_str == '0':
+            duration_hrs_str = ''
+        else:
+            duration_hrs_str = duration_hrs_str + 'hrs '
+        duration_minutes_str = str(minutes - ((minutes//60)*60))
+        self.duration_hrs_mins = duration_hrs_str + duration_minutes_str + 'mins'
+
+    """
+    this gets the last populate row on the provided spreadsheet and populates self.sheet_length with the value
+    """
+
+    def length(self, sheet):
+
+        sheet_dimensions = sheet.dimensions
+        dimension_colon = sheet_dimensions.rfind(":")
+        length_start_digit = dimension_colon + 2
+        sheet_length = sheet_dimensions[length_start_digit:]
+        sheet_length = int(sheet_length)
+        if sheet_length < 5:
+            self.sheet_length = 5
+        else:
+            self.sheet_length = sheet_length + 1
+
+    """
+    This sets the work and break lengths,
+    and gives an initial value to self.entry_work_duration
+    """
+
+    def info_set(self):
+
+        #takes an integer for workminutes
+        print('\nenter number of work minutes or type run:')
+        self.workminutes = input()
+        try:
+            self.workminutes = int(self.workminutes)
+        except:
+            self.workminutes = 'run'
+
+        #takes an integer for break minutes
+        print('\nenter number of break minutes or type run:')
+        self.breakminutes = input()
+        try:
+            self.breakminutes = int(self.breakminutes)
+        except:
+            self.breakminutes = 'run'
+
+        #This part saves session duration, or what time is set, with
+        # the intention of adding 'run' lengths later
+        if type(self.workminutes) == int and type(self.breakminutes) == int:
+            self.entry_work_duration = self.workminutes + self.breakminutes
+        if type(self.workminutes) == int and type(self.breakminutes) != int:
+            self.entry_work_duration = self.workminutes
+        if type(self.workminutes) != int and type(self.breakminutes) == int:
+            self.entry_work_duration = self.breakminutes
+        if type(self.workminutes) != int and type(self.breakminutes) != int:
+            self.entry_work_duration = 0
+
+    """
+    This method is for saving data to the spread sheet
+
+    """
+
+    def entry(self):
+
+        #loads the current project workbook
+        wb = load_workbook(filename=self.filename)
+        sheet = wb.active
+
+        #gets the length of the spread sheet table
+        self.length(sheet)
+        sheet_length_str = str(self.sheet_length)
+
+        #getting and displaying a list of unique work_types from the project
+        work_type_list = []
+        print('\n')
+        print('WORK-TYPES:')
+        for i in range(5, self.sheet_length+1):
+            work_type = sheet.cell(row = i, column = 3).value
+            if type(work_type) == str:
+                work_type = work_type.lower()
+                if work_type not in work_type_list:
+                    work_type_list.append(work_type)
+
+        #collecting an integer selection or string of new worktype
+        for x,y in enumerate(work_type_list):
+            list_item = str(x) + '. ' + y
+            print(list_item)
+        print('\nenter work type or a number from the list:')
+        work_type_selection = input()
+        print('\n')
+
+        #parsing entry
+        try:
+            work_type_selection_int = int(work_type_selection)
+            self.entry_work_type = work_type_list[work_type_selection_int]
+        except:
+            self.entry_work_type = work_type_selection
+        if self.entry_work_type == None:
+            self.entry_work_type = 'no work-type'
+
+        #Saving values to the sheet
+        entry_date = 'B' + sheet_length_str
+        sheet[entry_date].value = self.shift_start_time
+        entry_work_type = 'C' + sheet_length_str
+        sheet[entry_work_type].value = self.entry_work_type
+        entry_work_notes = 'D' + sheet_length_str
+        sheet[entry_work_notes].value = self.entry_info_diary_notes
+        entry_work_duration = 'E' + sheet_length_str
+        sheet[entry_work_duration].value = self.entry_work_duration
+        wb.save(filename=self.filename)
+        self.entry_info_diary_notes = ''
+
+    """
+    manual entry sets the start time and duration, then runs entry
+
+    """
+
+    def manual_entry(self):
+
+        #asks for all values needed to create a datetime object
+        print('year: ')
+        datetime_year = input()
+        datetime_year = int(datetime_year)
+        print('month: ')
+        datetime_month = input()
+        datetime_month = int(datetime_month)
+        print('day: ')
+        datetime_day = input()
+        datetime_day = int(datetime_day)
+        print('hour (e.g. 12:30): ')
+        datetime_hour_minutes = input()
+        datetime_hour = datetime_hour_minutes[:2]
+        datetime_minutes = datetime_hour_minutes[3:]
+        datetime_hour = int(datetime_hour)
+        datetime_minutes = int(datetime_minutes)
+
+        #gets the shift duration
+        print('shift duration: ')
+        shift_duration = input()
+        shift_duration = int(shift_duration)
+        self.shift_start_time = datetime.datetime(datetime_year, datetime_month, datetime_day, datetime_hour, datetime_minutes)
+        self.entry_work_duration = shift_duration
+
+        #runs entry to get the rest of the info and save it to the spreadsheet
+        self.entry()
+
+    """
+    this creates a list, this_week_dtos, of datetime.date() objects for this week going back to sunday,
+    and another one for last week, last_week_dtos
+    """
+
+    def create_this_week_dtos(self, *args):
+
+        #gets the datetime objects for the current day and week
+        #dto = datetime object
+        try:
+            current_day = args[0]
+        except:
+            current_day = datetime.datetime.now()
+        current_weekday_int = current_day.strftime('%w')
+        current_weekday_int = int(current_weekday_int)
+        self.this_week_dtos = []
+        self.last_week_dtos = []
+
+        #the following for loop doesn't append today so I just do it here
+        self.this_week_dtos.append(current_day.date())
+
+        #This loop creates a list of datetime.date() objects for the current week.
+        #current_weekday_int is based on strftime'%w', and it uses that to
+        # generate datetime objects for eveyday going back to Sunday
+        for i in range(0, current_weekday_int):
+
+            number_for_days = (current_weekday_int - (current_weekday_int - (i + 1)))
+            day_adjust = datetime.timedelta(days=number_for_days)
+            day_to_save = current_day - day_adjust
+            self.this_week_dtos.append(day_to_save.date())
+
+        #this creates a list of datetime.date() objects for last week
+        for i in range(0, 7):
+
+            number_for_days = current_weekday_int + (i + 1)
+            day_adjust = datetime.timedelta(days=number_for_days)
+            day_to_save = current_day - day_adjust
+            self.last_week_dtos.append(day_to_save.date())
+
+    """
+    SET VALUE: here is where I can set the allowable gap between shifts for sessions,
+    and also the points from sessions (currently shifts are divided by 20min,
+    for 6 points on a 2hr session. Length of sessions are set in the points section.)
+
+    creates a list of all shifts for this week and last week in raw_data_for_status
+    each entry contains the following: [start-time datetime object, str for worktype,
+    int for shift duration, str for project type, list with one value for session rating,
+    list with one value for consecutive day rating]
+
+    the args can either be an integer, which will subtract that many entries off the end of the list,
+    allowing for stats calculations of previous shifts. Made up shift entries can also be added to the args,
+    in which case they will be added to the end of the list to allow for hypothetical stats calculation.
+
+    create_this_week_dtos() needs to be run first because it uses this_week_dtos and last_week_dtos
+
+    """
+
+    def create_raw_data_for_status(self, *args):
+
+        #this is what gets populated with all entries
+        self.raw_data_for_status = []
+
+        #this makes sure these lists are sorted from earliest to latest
+        self.this_week_dtos = sorted(self.this_week_dtos)
+        self.last_week_dtos = sorted(self.last_week_dtos)
+
+        #this section sets whether the next part will search
+        # work projects or active leisure projects
+        for project_type in range(0,2):
+            if project_type == 0:
+                project_list = self.work_project_list
+            if project_type == 1:
+                project_list = self.al_project_list
+
+            #this loop will ultimately check all entries, keeping ones that are
+            # in either this_week_dtos or last_week_dtos
+            for project_key, project in enumerate(project_list):
+
+                wb = load_workbook(filename=project)
+                sheet = wb.active
+
+                self.length(sheet)
+
+                #this populates self.raw_data_for_status, which is a list of lists,
+                # for all entries after check_start_date and their values. It also
+                # adds the first 4 items of info, which comes from the spread sheet
+                for i in range(5, self.sheet_length):
+                    date_value = sheet.cell(row=i, column=2).value
+                    if date_value.date() in self.last_week_dtos or date_value.date() in self.this_week_dtos:
+                        date_to_append = date_value
+                        work_type_to_append = sheet.cell(row=i, column=3).value
+                        work_duration_to_append = sheet.cell(row=i, column=5).value
+                        if project_type == 0:
+                            activity_type_to_append = 'work'
+                        if project_type == 1:
+                            activity_type_to_append = 'active-leisure'
+                        data_to_append = [date_to_append, work_type_to_append, work_duration_to_append, activity_type_to_append]
+                        self.raw_data_for_status.append(data_to_append)
+
+        #because the active-leisure gets added after work, this re-sorts the dates
+        self.raw_data_for_status = sorted(self.raw_data_for_status)
+
+        #this checks if there's an int in the args, in which case that many entries are removed
+        # so that I can check previous balance stats. If in args is an entry, that gets added
+        # to check the ficitonal entries points.
+        try:
+            if type(args[0]) == int:
+                for i in range(0, args[0]):
+                    self.raw_data_for_status.pop(-1)
+            elif type(args[0]) == list:
+                for entry in args[0]:
+                    self.raw_data_for_status.append(entry)
+        except:
+            pass
+
+        #out of the following time_stamp_end_time and session_length_so_far are what get
+        # used in the following for loop. They get things started for measuring sessions
+        first_entry = self.raw_data_for_status[0]
+        session_start_time = first_entry[0]
+        time_adjust_int = first_entry[2]
+        time_adjust = datetime.timedelta(minutes=time_adjust_int)
+        time_stamp_end_time = session_start_time + time_adjust
+        session_length_so_far = 0
+
+        #this is for measuring consecutive day ratings
+        time_totals_by_day = {}
+
+        #this is the loop that does the calculations of session stats and consecutive day stats
+        # the last two items of info in the entry. the first four are already populated from the spreadsheets
+        for data_entry in self.raw_data_for_status:
+
+            #this section measures sessions, with one rating point equal to 20min,
+            # so rating 6 or over is 2hrs or over.
+            #the timedelta here sets the length of time allowed between timestamps
+            # where it's still part of the session
+            if data_entry[0] > time_stamp_end_time + datetime.timedelta(minutes=15):
+                session_start_time = data_entry[0]
+                time_adjust_int = data_entry[2]
+                time_adjust = datetime.timedelta(minutes=time_adjust_int)
+                time_stamp_end_time = session_start_time + time_adjust
+                session_length_so_far = data_entry[2]
+                session_rating = session_length_so_far // self.session_points_divider
+            else:
+                session_length_so_far = session_length_so_far + data_entry[2]
+                session_rating = session_length_so_far // self.session_points_divider
+                session_start_time = data_entry[0]
+                time_adjust_int = data_entry[2]
+                time_adjust = datetime.timedelta(minutes=time_adjust_int)
+                time_stamp_end_time = session_start_time + time_adjust
+
+            #adds the value to the end of the entry in raw_data_for_status
+            data_entry.append([session_rating])
+
+            #this builds, with each data_entry, time_totals_by_day with today and yesterday date keys,
+            # and the value of an additional dictionary of worktype keys for that day, with timesums
+            consecutive_day_rating = 1
+            time_totals_to_calculate = {}
+            #simple_worktype is the first word of the worktype, which is what's used for goals
+            simple_worktype = data_entry[1].split()[0]
+            if simple_worktype in self.worktypes_for_goals and self.worktypes_for_goals[simple_worktype][0] != 0:
+                if data_entry[0].date() in time_totals_by_day:
+                    if simple_worktype in time_totals_by_day[data_entry[0].date()]:
+                        time_totals_by_day[data_entry[0].date()][simple_worktype] = \
+                            time_totals_by_day[data_entry[0].date()][simple_worktype] + data_entry[2]
+                    else:
+                        time_totals_by_day[data_entry[0].date()][simple_worktype] = data_entry[2]
+                else:
+                    time_totals_by_day[data_entry[0].date()] = {simple_worktype: data_entry[2]}
+
+                #this populates time_totals_to_calculate with time_totals_by_day entries that are for the data_entry
+                # day or earlier and for the data entry worktype
+                for date in time_totals_by_day:
+                    if data_entry[0].date() - date >= datetime.timedelta(days=0):
+                        if simple_worktype in time_totals_by_day[date]:
+                            time_totals_to_calculate[date] = time_totals_by_day[date][simple_worktype]
+
+                #this checks the totals for the worktype for each day going backwards from today
+                #adding a point for each day that is over the goal-time, and breaking when it finds a
+                #non-consecutive day
+                for i in range(1, self.max_consecutive_day_multiplier):
+                    if (data_entry[0].date() - datetime.timedelta(days=i)) in time_totals_to_calculate:
+                        if time_totals_to_calculate[data_entry[0].date() - datetime.timedelta(days=i)] >= \
+                        self.worktypes_for_goals[simple_worktype][0]:
+                            consecutive_day_rating = consecutive_day_rating + 1
+                    else:
+                        break
+
+            #adds the value to the end of the entry in raw_data_for_status
+            data_entry.append([consecutive_day_rating])
+
+    """
+    creates timesums for today and this week, overall and for goals
+    create_this_week_dtos and create_raw_data_for_status must be run first,
+    because this gets its info from raw_data_for_status
+    """
+    def create_timesum_stats(self):
+
+
+        #resets the dictionaries, with project-types included.
+        self.day_goal_timesums = {'active-leisure': 0, 'work': 0}
+        self.week_goal_timesums = {'active-leisure': 0, 'work': 0}
+        self.day_timesums = {'active-leisure': 0, 'work': 0}
+        self.week_timesums = {'active-leisure': 0, 'work': 0}
+        self.timesums_by_day = {}
+
+        #resets the lists of today and this week's shifts
+        today_session_shifts_list = []
+        this_week_session_shifts_list = []
+
+        #sorts to ensure [-1] is today
+        self.this_week_dtos = sorted(self.this_week_dtos)
+
+        #populates today_session_shifts_list with all of today's shifts
+        for shift in self.raw_data_for_status:
+            if shift[0].date() == self.this_week_dtos[-1]:
+                today_session_shifts_list.append(shift)
+
+        #populates this_week_session_shifts_list with all shifts from this week
+        for shift in self.raw_data_for_status:
+            if shift[0].date() in self.this_week_dtos:
+                this_week_session_shifts_list.append(shift)
+
+        #this populates self.day_timesums with totals for all worktypes
+        # the last line is for project type, which gets created with the dict
+        for shift in today_session_shifts_list:
+            if shift[1] in self.day_timesums:
+                self.day_timesums[shift[1]] = self.day_timesums[shift[1]] + shift[2]
+            else:
+                self.day_timesums[shift[1]] = shift[2]
+            self.day_timesums[shift[3]] = self.day_timesums[shift[3]] + shift[2]
+
+        #adds worktypes in day_timesums that have goals set to the dictionary self.day_goal_timesums
+        for worktype in self.day_timesums:
+            simple_worktype = worktype.split()[0]
+            if simple_worktype in self.worktypes_for_goals or simple_worktype in self.project_types_for_goals:
+                if simple_worktype in self.day_goal_timesums:
+                    self.day_goal_timesums[simple_worktype] = self.day_goal_timesums[simple_worktype] + \
+                    self.day_timesums[worktype]
+                else:
+                    self.day_goal_timesums[simple_worktype] = self.day_timesums[worktype]
+
+        #adds worktypes that have goals but no timesums yet
+        for worktype in self.worktypes_for_goals:
+            if worktype not in self.day_goal_timesums:
+                self.day_goal_timesums[worktype] = 0
+
+        #removes worktypes that have goal-minutes set to 0
+        for worktype in self.worktypes_for_goals:
+            if self.worktypes_for_goals[worktype][0] == 0 and worktype in self.day_goal_timesums:
+                self.day_goal_timesums.pop(worktype)
+
+        #this populates self.week_timesums with totals for all worktypes
+        # the last line is for project type, which gets created with the dict
+        for shift in this_week_session_shifts_list:
+            if shift[1] in self.week_timesums:
+                self.week_timesums[shift[1]] = self.week_timesums[shift[1]] + shift[2]
+            else:
+                self.week_timesums[shift[1]] = shift[2]
+            self.week_timesums[shift[3]] = self.week_timesums[shift[3]] + shift[2]
+
+        #adds worktypes in week_timesums that have goals set to week_goal_timesums
+        for worktype in self.week_timesums:
+            simple_worktype = worktype.split()[0]
+            if simple_worktype in self.worktypes_for_goals or simple_worktype in self.project_types_for_goals:
+                if simple_worktype in self.week_goal_timesums:
+                    self.week_goal_timesums[simple_worktype] = self.week_goal_timesums[simple_worktype] + \
+                    self.week_timesums[worktype]
+                else:
+                    self.week_goal_timesums[simple_worktype] = self.week_timesums[worktype]
+
+        #adds worktypes that have goals but no timesums yet
+        for worktype in self.worktypes_for_goals:
+            if worktype not in self.week_goal_timesums:
+                self.week_goal_timesums[worktype] = 0
+
+        #removes worktypes that have goal-minutes set to 0
+        for worktype in self.worktypes_for_goals:
+            if self.worktypes_for_goals[worktype][1] == 0 and worktype in self.week_goal_timesums:
+                self.week_goal_timesums.pop(worktype)
+
+        for shift in self.raw_data_for_status:
+            if shift[0].date() in self.timesums_by_day:
+                if shift[3] == 'active-leisure':
+                    self.timesums_by_day[shift[0].date()][0] = self.timesums_by_day[shift[0].date()][0] + shift[2]
+                elif shift[3] == 'work':
+                    self.timesums_by_day[shift[0].date()][1] = self.timesums_by_day[shift[0].date()][1] + shift[2]
+            else:
+                if shift[3] == 'active-leisure':
+                    self.timesums_by_day[shift[0].date()] = [shift[2], 0]
+                elif shift[3] == 'work':
+                    self.timesums_by_day[shift[0].date()] = [0, shift[2]]
+
+
+    """
+    SET VALUE: points earned from goals are set here by the int for dividing into the
+    timesums. right now 10min for day-goals, 30min for week-goals.
+
+    populates the points_dict with the following:
+    {key=start-time-datetime-objecet: value=[data_entry from raw_data_for_status,
+    multiplier_dict{key=points-factor-str: value=int to multiply points}, int for total points]}
+
+    create_this_week_dtos, create_raw_data_for_status, create_timesum_stats, and create_balance_stats
+    must all be run first.
+
+    *ARGS: optional 'print' can be included to print the points when this method is run (can also be printed
+    from stats_printer)
+
+    """
+
+    def create_points_stats(self, *args):
+
+
+        if 'print' in args:
+            #these are used only in the optional print version, at the bottom
+            last_week_points_sum = 0
+            this_week_points_sum = 0
+            points_sums_by_day = {}
+            #in the print option these have to be run first, because they wont be by stats_printer()
+            self.create_raw_data_for_status()
+            self.create_timesum_stats()
+            self.create_balance_stats()
+
+        #this for loop will go through raw_data_for_status starting from the end (most recent) entry
+        # and populate points_dict.
+        number_of_entries = len(self.raw_data_for_status)
+
+        for arg in args:
+            if type(arg) == int:
+                number_of_entries = arg
+
+        self.points_dict = {}
+
+        for i in range(0, number_of_entries):
+            #this part runs create_this_week_dtos() to reset it for future changes
+            # then it runs create_raw_data_for_status with reverse_index so self.raw_data_for_status
+            # is created with the shift this is calculating points for at the end
+            # after that it runs create_this_week_dtos with the examined shift's start date,
+            # and then timesum stats for that start date to get goal calculations
+            reverse_index = number_of_entries - (i + 1)
+            self.create_this_week_dtos()
+            self.create_raw_data_for_status(reverse_index)
+            new_today_date = self.raw_data_for_status[-1][0]
+            self.create_this_week_dtos(new_today_date)
+            self.create_timesum_stats()
+            entry = self.raw_data_for_status[-1]
+            #this is where the base points are set, and the rest of the method will determine multipliers
+            # base points are meant to favour 20minute shifts. base points increase with minutes up to 20minutes,
+            # because this rewards more points to longer shifts. After 20minutes points increase at a much slower rate,
+            # and not at all after 60minutes. In this scheme 30minute shifts generate less points than 20minutes shifts,
+            # but only a little less. 60 minute shifts generate substantially less points, and obviously after that there's
+            # no difference between 60 minute shifts or shift of any other length.
+            entry_points = entry[2]
+            if entry_points in range(21, 24):
+                entry_points = 20
+            if entry_points in range(24, 26):
+                entry_points = 23
+            if entry_points in range(26, 29):
+                entry_points = 24
+            if entry_points in range(29, 32):
+                entry_points = 25
+            if entry_points in range(32, 36):
+                entry_points = 26
+            if entry_points in range(36, 41):
+                entry_points = 27
+            if entry_points in range(41, 56):
+                entry_points = 28
+            if entry_points in range(56, 60):
+                entry_points = 29
+            if entry_points >= 60:
+                entry_points = 30
+            #the multiplier dict starts empty but it always has the same list of keys
+            # the session rating takes some calculation because in raw_data_for_status
+            # its just the number of times the session is divided by 20min. but here
+            # 6 is the max number and as the raw-number goes up from 6, here it goes down.
+            multiplier_dict = {}
+            multiplier_dict['session_rating'] = entry[4][0]
+            if multiplier_dict['session_rating'] > self.session_max_multiplier:
+                multiplier_dict['session_rating'] = self.session_max_multiplier - \
+                (multiplier_dict['session_rating'] - self.session_max_multiplier)
+            if multiplier_dict['session_rating'] < 1:
+                multiplier_dict['session_rating'] = 1
+            #consecutive day rating requires no further calculations
+            multiplier_dict['consecutive_day_rating'] = entry[5][0]
+            #this creates multiplier points based on a chosen division of the daysum
+            try:
+                simple_worktype = entry[1].split()[0]
+                multiplier_dict['worktype_day_goal'] = self.day_goal_timesums[simple_worktype] // \
+                self.worktype_day_goal_points_divider
+                if multiplier_dict['worktype_day_goal'] < 1:
+                    multiplier_dict['worktype_day_goal'] = 1
+                #this is trying to make it go up and down like sessions. don't know if it works.
+                if multiplier_dict['worktype_day_goal'] > self.worktypes_for_goals[simple_worktype][0] // \
+                self.worktype_day_goal_points_divider:
+                    multiplier_dict['worktype_day_goal'] = (self.worktypes_for_goals[simple_worktype][0] // \
+                    self.worktype_day_goal_points_divider) - multiplier_dict['worktype_day_goal']
+                    if multiplier_dict['worktype_day_goal'] < 1:
+                        multiplier_dict['worktype_day_goal'] = 1
+            #I'm not sure why I need the exception, but I think it came from key error
+            except:
+                multiplier_dict['worktype_day_goal'] = 1
+
+            #same as above but for week goals
+            try:
+                simple_worktype = entry[1].split()[0]
+                multiplier_dict['worktype_week_goal'] = self.week_goal_timesums[simple_worktype] // \
+                self.worktype_week_goal_points_divider
+                if multiplier_dict['worktype_week_goal'] < 1:
+                    multiplier_dict['worktype_week_goal'] = 1
+                if multiplier_dict['worktype_week_goal'] > self.worktypes_for_goals[simple_worktype][1] // \
+                self.worktype_week_goal_points_divider:
+                    multiplier_dict['worktype_week_goal'] = (self.worktypes_for_goals[simple_worktype][1] // \
+                    self.worktype_week_goal_points_divider) - multiplier_dict['worktype_week_goal']
+                    if multiplier_dict['worktype_week_goal'] < 1:
+                        multiplier_dict['worktype_week_goal'] = 1
+            except:
+                multiplier_dict['worktype_week_goal'] = 1
+
+            #same as above for day project type goals
+            try:
+                multiplier_dict['project_type_day_goal'] = self.day_goal_timesums[entry[3]] // \
+                self.project_type_day_goal_points_divider
+                if multiplier_dict['project_type_day_goal'] < 1:
+                    multiplier_dict['project_type_day_goal'] = 1
+                if multiplier_dict['project_type_day_goal'] > self.project_types_for_goals[entry[3]][0] // \
+                self.project_type_day_goal_points_divider:
+                    multiplier_dict['project_type_day_goal'] = (self.project_types_for_goals[entry[3]][0] // \
+                    self.project_type_day_goal_points_divider) - multiplier_dict['project_type_day_goal']
+                    if multiplier_dict['project_type_day_goal'] < 1:
+                        multiplier_dict['project_type_day_goal'] = 1
+            except:
+                multiplier_dict['project_type_day_goal'] = 1
+
+            #same as above for week project type goals
+            try:
+                multiplier_dict['project_type_week_goal'] = self.week_goal_timesums[entry[3]] // \
+                self.project_type_week_goal_points_divider
+                if multiplier_dict['project_type_week_goal'] < 1:
+                    multiplier_dict['project_type_week_goal'] = 1
+                if multiplier_dict['project_type_week_goal'] > self.project_types_for_goals[entry[3]][1] // \
+                self.project_type_week_goal_points_divider:
+                    multiplier_dict['project_type_week_goal'] = (self.project_types_for_goals[entry[3]][1] // \
+                    self.project_type_week_goal_points_divider) - multiplier_dict['project_type_week_goal']
+                    if multiplier_dict['project_type_week_goal'] < 1:
+                        multiplier_dict['project_type_week_goal'] = 1
+            except:
+                multiplier_dict['project_type_week_goal'] = 1
+
+            #this sets the stats back an entry to calculate what the balance rating was then,
+            # because that's the rating that should apply to points for this shift
+            try:
+                self.create_raw_data_for_status(reverse_index + 1)
+                new_today_date = self.raw_data_for_status[-1][0]
+                self.create_this_week_dtos(new_today_date)
+                self.create_timesum_stats()
+                self.create_balance_stats()
+            #this is in case there is no previous entry, in which case the current balance ratings will be used.
+            except:
+                pass
+
+            #balance ratings shouldn't require further calculations. However, ratings are only given
+            # to worktypes with day-goals. the try/excepts here are for worktypes without goals (i.e. key errors)
+            try:
+                multiplier_dict['worktype_day_balance'] = self.today_worktype_balance_ratings[entry[1]]
+            except:
+                multiplier_dict['worktype_day_balance'] = 1
+            try:
+                multiplier_dict['worktype_week_balance'] = self.week_worktype_balance_ratings[entry[1]]
+            except:
+                multiplier_dict['worktype_week_balance'] = 1
+            try:
+                multiplier_dict['project_type_day_balance'] = self.today_project_type_balance_ratings[entry[3]]
+            except:
+                multiplier_dict['project_type_day_balance'] = 1
+            try:
+                multiplier_dict['project_type_week_balance'] = self.week_project_type_balance_ratings[entry[3]]
+            except:
+                multiplier_dict['project_type_week_balance'] = 1
+
+            #this goes through and multiplies the base points (number of minutes for the shift)
+            # by all multipliers. Everything will be one or over.
+            for multiplier in multiplier_dict:
+                entry_points = entry_points * multiplier_dict[multiplier]
+
+            #populates the points_dict
+            self.points_dict[entry[0]] = [entry, multiplier_dict, entry_points]
+
+            if 'print' in args:
+
+                #populates the following variables with info from points_dict, and prints all details
+                # from points dict for each shift this week and last week
+                print('\n')
+                print('{:^15} | {:^15.5} | {:^30}:{:<4} | {:^15}'.format(self.points_dict[entry[0]][0][0].strftime('%Y/%m/%d'),
+                    self.points_dict[entry[0]][0][0].strftime('%X'), self.points_dict[entry[0]][0][1], self.points_dict[entry[0]][0][2],
+                    self.points_dict[entry[0]][0][3]))
+                print('\n')
+                for multiplier_str in self.points_dict[entry[0]][1]:
+                    print('{:30}{}'.format(multiplier_str, self.points_dict[entry[0]][1][multiplier_str]))
+                print('\n')
+                points_str = str(self.points_dict[entry[0]][2])
+                print('points: ' + points_str)
+
+                #calculates the point sums for this and last week. It resets create_this_week_dtos
+                # to this week from the adjust above for calculating points
+                self.create_this_week_dtos()
+                if self.points_dict[entry[0]][0][0].date() in self.this_week_dtos:
+                    this_week_points_sum = this_week_points_sum + self.points_dict[entry[0]][2]
+                elif self.points_dict[entry[0]][0][0].date() in self.last_week_dtos:
+                    last_week_points_sum = last_week_points_sum + self.points_dict[entry[0]][2]
+
+                #calculates the points sum for each day
+                if self.points_dict[entry[0]][0][0].date() in points_sums_by_day:
+                    points_sums_by_day[self.points_dict[entry[0]][0][0].date()] = \
+                    points_sums_by_day[self.points_dict[entry[0]][0][0].date()] + \
+                    self.points_dict[entry[0]][2]
+                else:
+                    points_sums_by_day[self.points_dict[entry[0]][0][0].date()] = \
+                    self.points_dict[entry[0]][2]
+
+        #prints sums for this week, last week, and each day
+        if 'print' in args:
+            this_week_points_sum = int(this_week_points_sum)
+            last_week_points_sum = int(last_week_points_sum)
+            print('\n')
+            print('last week points sum: {:,}'.format(last_week_points_sum))
+            print('this week points sum: {:,}'.format(this_week_points_sum))
+            print('\n')
+            for day in points_sums_by_day:
+                points_int = int(points_sums_by_day[day])
+                day_str = str(day)
+                print('{}: {:,}'.format(day_str, points_int))
+
+        self.create_this_week_dtos()
+
+
+    """
+    SET VALUE: here determines the points that come from inbalance, right now today points
+    are set as the actual number calculated, but week is half that.
+
+    This populates the four variables listed first in the method with whole number balance ratings
+    for project types and all worktypes that have goals. the ratings are used directly in points
+    calculation as multipliers, but create_points_stats() determines ratings for the shift previous
+    to the one it's examining to create the points. Thus the balance ratings created here are really
+    where they are as of the end of the shift, and for the purposes of the next shift.
+
+    create_this_week_dtos, create_raw_data_for_status, and create_timesum_stats must be run first before
+    this method.
+
+    """
+    def create_balance_stats(self):
+
+        #loops either for balance stats for today, or this week
+        self.week_worktype_balance_ratings = {}
+        self.today_worktype_balance_ratings = {}
+        self.week_project_type_balance_ratings = {'active-leisure': 1, 'work': 1}
+        self.today_project_type_balance_ratings = {'active-leisure': 1, 'work': 1}
+
+        #these will be lists of numbers between 0 and 1 that represent progress through goals
+        # they are used in the calculations for balance ratings, explained below.
+        today_rating_list = []
+        this_week_rating_list = []
+
+        self.this_week_dtos = sorted(self.this_week_dtos)
+
+        #populates today and week balance ratings with percent progress numbers
+        # by dividing timesums for work and active-leisure by the goals
+        project_types = ['active-leisure', 'work']
+        for project_type in project_types:
+            self.week_project_type_balance_ratings[project_type] = self.week_goal_timesums[project_type] / \
+                self.project_types_for_goals[project_type][1]
+            if self.week_project_type_balance_ratings[project_type] > 1:
+                self.week_project_type_balance_ratings[project_type] = 1
+            self.today_project_type_balance_ratings[project_type] = self.day_goal_timesums[project_type] / \
+                self.project_types_for_goals[project_type][0]
+            if self.today_project_type_balance_ratings[project_type] > 1:
+                self.today_project_type_balance_ratings[project_type] = 1
+
+        #checks to see which has less progress, because that will have the balance points
+        # it subtracts the percent progress of the lesser from the greater, multiplies that by 10
+        # to give a whole number rating, then divides that by 3, which keeps the points low, and rounds that.
+        timeframe_types = ['today', 'this week']
+        for timeframe_type in timeframe_types:
+            if timeframe_type == 'this week':
+                timeframe = self.week_project_type_balance_ratings
+            elif timeframe_type == 'today':
+                timeframe = self.today_project_type_balance_ratings
+            if timeframe['active-leisure'] > timeframe['work']:
+                timeframe['work'] = ((timeframe['active-leisure'] - timeframe['work']) * 10) / 3
+                timeframe['work'] = round(timeframe['work'], 0)
+                if timeframe['work'] < 1:
+                    timeframe['work'] = 1
+                timeframe['active-leisure'] = 1
+            elif timeframe['work'] > timeframe['active-leisure']:
+                timeframe['active-leisure'] = ((timeframe['work'] - timeframe['active-leisure']) * 10) / 3
+                timeframe['active-leisure'] = round(timeframe['active-leisure'], 0)
+                if timeframe['active-leisure'] < 1:
+                    timeframe['active-leisure'] = 1
+                timeframe['work'] = 1
+            elif timeframe['work'] == timeframe['active-leisure']:
+                timeframe['work'] = 1
+                timeframe['active-leisure'] = 1
+
+        #this creates a list of percent progress through day-goals and populates today_rating_list
+        # for balance rating calculations
+        for worktype in self.day_goal_timesums:
+            if worktype != 'active-leisure' and worktype != 'work':
+                percent_progress = self.day_goal_timesums[worktype] / self.worktypes_for_goals[worktype][0]
+                if percent_progress > 1:
+                    percent_progress = 1
+                self.today_worktype_balance_ratings[worktype] = percent_progress
+                today_rating_list.append(percent_progress)
+
+        #this creates a list of percent progress through week-goals and populates this_week_rating_list
+        # for balance rating calculations
+        for worktype in self.week_goal_timesums:
+            if worktype != 'active-leisure' and worktype != 'work':
+                percent_progress = self.week_goal_timesums[worktype] / self.worktypes_for_goals[worktype][1]
+                if percent_progress > 1:
+                    percent_progress = 1
+                self.week_worktype_balance_ratings[worktype] = percent_progress
+                this_week_rating_list.append(percent_progress)
+
+        #this adds the variance and mean from the day and week rating lists to create a top threshold for when
+        # a worktype's time accumulation no longer earns balance points.
+        this_week_rating_list_variance = statistics.variance(this_week_rating_list)
+        this_week_rating_list_mean = statistics.mean(this_week_rating_list)
+        this_week_balance_rating_threshold = this_week_rating_list_mean + this_week_rating_list_variance
+        today_rating_list_variance = statistics.variance(today_rating_list)
+        today_rating_list_mean = statistics.mean(today_rating_list)
+        today_balance_rating_threshold = today_rating_list_mean + today_rating_list_variance
+
+        #the worktype's progress is subtracted from the threshold to get the balance rating.
+        for worktype in self.week_worktype_balance_ratings:
+            self.week_worktype_balance_ratings[worktype] = this_week_balance_rating_threshold - \
+            self.week_worktype_balance_ratings[worktype]
+            if self.week_worktype_balance_ratings[worktype] < 0:
+                self.week_worktype_balance_ratings[worktype] = 0
+
+        #for multiplying points, the balance rating is multiplied by ten and rounded to create a whole number.
+        #because this is for weeks, the number is divided by 2, thus half the points of that for days.
+        for worktype in self.week_worktype_balance_ratings:
+            self.week_worktype_balance_ratings[worktype] = self.week_worktype_balance_ratings[worktype] * 10
+            self.week_worktype_balance_ratings[worktype] = self.week_worktype_balance_ratings[worktype] / 2
+            self.week_worktype_balance_ratings[worktype] = round(self.week_worktype_balance_ratings[worktype], 0)
+            if self.week_worktype_balance_ratings[worktype] < 1:
+                self.week_worktype_balance_ratings[worktype] = 1
+
+        #the worktype's progress is subtracted from the threshold to get the balance rating.
+        for worktype in self.today_worktype_balance_ratings:
+            self.today_worktype_balance_ratings[worktype] = today_balance_rating_threshold - \
+            self.today_worktype_balance_ratings[worktype]
+            if self.today_worktype_balance_ratings[worktype] < 0:
+                self.today_worktype_balance_ratings[worktype] = 0
+
+        #for multiplying points, the balance rating is multiplied by ten and rounded to create a whole number.
+        for worktype in self.today_worktype_balance_ratings:
+            self.today_worktype_balance_ratings[worktype] = self.today_worktype_balance_ratings[worktype] * 10
+            self.today_worktype_balance_ratings[worktype] = round(self.today_worktype_balance_ratings[worktype], 0)
+            if self.today_worktype_balance_ratings[worktype] < 1:
+                self.today_worktype_balance_ratings[worktype] = 1
+
+    """
+    this creates stats for what goals were achieved last week
+    """
+    def create_goal_stats(self):
+
+
+        #this creates a dictionary of entries that are worktype goals, organized by day for last week
+        entries_by_day = {}
+        for entry in self.raw_data_for_status:
+            if entry[0].date() in self.last_week_dtos:
+                simple_worktype = entry[1].split()[0]
+                if simple_worktype in self.worktypes_for_goals:
+                    if entry[0].date() in entries_by_day:
+                        entries_by_day[entry[0].date()].append(entry)
+                    else:
+                        entries_by_day[entry[0].date()] = [entry]
+
+        #this creates timesums for each worktype in each day,
+        last_week_day_goals_timesums = {'active-leisure': 0, 'work': 0}
+        self.last_week_day_goals = {'active-leisure': 0, 'work': 0}
+        for entry in entries_by_day:
+            for day in entries_by_day[entry]:
+                simple_worktype = day[1].split()[0]
+                if simple_worktype in last_week_day_goals_timesums:
+                    last_week_day_goals_timesums[simple_worktype] = last_week_day_goals_timesums[simple_worktype] + day[2]
+                else:
+                    last_week_day_goals_timesums[simple_worktype] = day[2]
+                last_week_day_goals_timesums[day[3]] = last_week_day_goals_timesums[day[3]] + day[2]
+
+            #for any timesum that's greater than the goal, it gets counted in self.last_week_day_goals
+            for worktype in last_week_day_goals_timesums:
+                if worktype == 'active-leisure' or worktype == 'work':
+                    if last_week_day_goals_timesums[worktype] >= self.project_types_for_goals[worktype][0]:
+                        if worktype in self.last_week_day_goals:
+                            self.last_week_day_goals[worktype] = self.last_week_day_goals[worktype] + 1
+                        else:
+                            self.last_week_day_goals[worktype] = 1
+                else:
+                    if last_week_day_goals_timesums[worktype] >= self.worktypes_for_goals[worktype][0]:
+                        if worktype in self.last_week_day_goals:
+                            self.last_week_day_goals[worktype] = self.last_week_day_goals[worktype] + 1
+                        else:
+                            self.last_week_day_goals[worktype] = 1
+            last_week_day_goals_timesums = {'active-leisure': 0, 'work': 0}
+
+        #this section just creates timesums for last week for worktype goals. The rest of the calculations
+        # for finding out what goals were achieved are done in stats_printer()
+        self.last_week_week_goals = {'active-leisure': 0, 'work': 0}
+        for entry in self.raw_data_for_status:
+            if entry[0].date() in self.last_week_dtos:
+                simple_worktype = entry[1].split()[0]
+                if simple_worktype in self.worktypes_for_goals:
+                    if simple_worktype in self.last_week_week_goals:
+                        self.last_week_week_goals[simple_worktype] = self.last_week_week_goals[simple_worktype] + entry[2]
+                    else:
+                        self.last_week_week_goals[simple_worktype] = entry[2]
+                self.last_week_week_goals[entry[3]] = self.last_week_week_goals[entry[3]] + entry[2]
+
+
+    """
+    This is for the overall stats
+    """
+    def create_base_stats(self):
+
+        self.create_this_week_dtos()
+        self.this_week_dtos = sorted(self.this_week_dtos)
+
+        #reset the stats variables to 0
+        self.al_today_timesum = 0
+        self.work_today_timesum = 0
+        self.al_week_timesum = 0
+        self.work_week_timesum = 0
+        self.work_projects_times = []
+        self.al_projects_times = []
+        self.work_projects_times_display = []
+        self.al_projects_times_display = []
+
+
+
+        #getting the stats from the work project list
+        for project_key, project in enumerate(self.work_project_list):
+
+            wb = load_workbook(filename=project)
+            sheet = wb.active
+
+            self.length(sheet)
+
+            self.work_projects_times.append([0,0])
+
+            #populating the today worktype timesums and today work-projects timesum from work projects
+
+
+
+            for i in range(5, self.sheet_length):
+                date_value = sheet.cell(row=i, column=2).value
+                if date_value.date() == self.this_week_dtos[-1]:
+                    #get the values
+                    worktype_value = sheet.cell(row=i, column=3).value
+                    time_entry_value = sheet.cell(row=i, column=5).value
+                    time_entry_value = int(time_entry_value)
+
+                    #populate the totals for each project
+                    entry_to_edit = self.work_projects_times[project_key]
+                    entry_to_edit[1] = entry_to_edit[1] + time_entry_value
+
+                    #populate the today work-projects timesum
+                    self.work_today_timesum = self.work_today_timesum + time_entry_value
+
+            #populating the weeks worktype timesums and week work-projects timesum
+            for i in range(5, self.sheet_length):
+                date_value = sheet.cell(row=i, column=2).value
+                for dto_entry in self.this_week_dtos:
+                    #get the values
+                    if date_value.date() == dto_entry:
+                        worktype_value = sheet.cell(row=i, column=3).value
+                        time_entry_value = sheet.cell(row=i, column=5).value
+                        time_entry_value = int(time_entry_value)
+
+                        #populate the totals for each project
+                        entry_to_edit = self.work_projects_times[project_key]
+                        entry_to_edit[0] = entry_to_edit[0] + time_entry_value
+
+                        #populate the week work-projects timesum
+                        self.work_week_timesum = self.work_week_timesum + time_entry_value
+
+        for project_key, project in enumerate(self.al_project_list):
+
+            wb = load_workbook(filename=project)
+            sheet = wb.active
+
+            self.length(sheet)
+
+            self.al_projects_times.append([0,0])
+
+            #populating the today worktype timesums and today al-projects timesum from al projects
+            for i in range(5, self.sheet_length):
+                date_value = sheet.cell(row=i, column=2).value
+                if date_value.date() == self.this_week_dtos[-1]:
+                    #get the values
+                    worktype_value = sheet.cell(row=i, column=3).value
+                    time_entry_value = sheet.cell(row=i, column=5).value
+                    time_entry_value = int(time_entry_value)
+
+                    #populate the totals for each project
+
+                    entry_to_edit = self.al_projects_times[project_key]
+                    entry_to_edit[1] = entry_to_edit[1] + time_entry_value
+
+                    #populate the today al-projects timesum
+                    self.al_today_timesum = self.al_today_timesum + time_entry_value
+
+            #populating the weeks worktype timesums and week al-projects timesum
+            for i in range(5, self.sheet_length):
+                date_value = sheet.cell(row=i, column=2).value
+                for dto_entry in self.this_week_dtos:
+                    #get the values
+                    if date_value.date() == dto_entry:
+                        worktype_value = sheet.cell(row=i, column=3).value
+                        time_entry_value = sheet.cell(row=i, column=5).value
+                        time_entry_value = int(time_entry_value)
+
+                        #populate the totals for each project
+                        entry_to_edit = self.al_projects_times[project_key]
+                        entry_to_edit[0] = entry_to_edit[0] + time_entry_value
+
+                        #populate the week al-projects timesum
+                        self.al_week_timesum = self.al_week_timesum + time_entry_value
+
+        for project in self.work_projects_times:
+            self.hrs(project[1])
+            day_entry = 'today\'s total: ' + self.duration_hrs_mins
+            self.hrs(project[0])
+            both_entries = day_entry + ' | this week\'s totals: ' + self.duration_hrs_mins
+            self.work_projects_times_display.append(both_entries)
+
+        for project in self.al_projects_times:
+            self.hrs(project[1])
+            day_entry = 'today\'s total: ' + self.duration_hrs_mins
+            self.hrs(project[0])
+            both_entries = day_entry + ' | this week\'s totals: ' + self.duration_hrs_mins
+            self.al_projects_times_display.append(both_entries)
+
+    """
+    This gives all the stats for the project, including all goals
+    (will have to loop through the string lists)
+    """
+
+    def project_stats(self):
+
+        wb = load_workbook(filename=self.filename)
+        sheet = wb.active
+
+        self.length(sheet)
+        """
+        Getting value lists for stats by day
+        """
+        #list of groups of rows by day
+        print('\nWORK DAYS:')
+        row_range_by_day_list = []
+        current_day = ''
+        for i in range(5, self.sheet_length):
+            date_value = sheet.cell(row=i, column=2).value
+            day_value = date_value.date()
+            if day_value == current_day:
+                row_range_by_day_list[-1].append(i)
+            else:
+                row_range_by_day_list.append([i])
+            current_day = day_value
+
+        #building lists and printing info
+        for range_item in row_range_by_day_list:
+            work_type_list = []
+            work_type_durations_list = []
+            for i in range_item:
+                #entering the date over and over, should improve this
+                day_entry_raw = sheet.cell(row = i, column = 2).value
+                day_entry_year = str(day_entry_raw.year)
+                day_entry_month = str(day_entry_raw.month)
+                day_entry_day = str(day_entry_raw.day)
+                day_entry_str = day_entry_year + "/" + day_entry_month + "/" + day_entry_day
+
+                #builds the lists for each range
+                work_type = sheet.cell(row = i, column = 3).value
+                if type(work_type) == str:
+                    work_duration_minutes = sheet.cell(row = i, column = 5).value
+                    work_type = work_type.lower()
+                    if work_type not in work_type_list:
+                        work_type_list.append(work_type)
+                        work_type_durations_list.append(work_duration_minutes)
+                    else:
+                        item_location = work_type_list.index(work_type)
+                        work_type_durations_list[item_location] = work_type_durations_list[item_location] + work_duration_minutes
+
+            print('\n' + day_entry_str)
+            for i in range(0, len(work_type_list)):
+                type_duration_int = work_type_durations_list[i]
+                self.hrs(type_duration_int)
+                print(work_type_list[i] + ': ' + self.duration_hrs_mins)
+
+        """
+        Grabs and prints the list of work-type and duration totals
+        """
+        work_type_list = []
+        work_type_durations_list = []
+        for i in range(5, self.sheet_length+1):
+            work_type = sheet.cell(row = i, column = 3).value
+            if type(work_type) == str:
+                work_duration_minutes = sheet.cell(row = i, column = 5).value
+                work_type = work_type.lower()
+                if work_type not in work_type_list:
+                    work_type_list.append(work_type)
+                    work_type_durations_list.append(work_duration_minutes)
+                else:
+                    item_location = work_type_list.index(work_type)
+                    work_type_durations_list[item_location] = work_type_durations_list[item_location] + work_duration_minutes
+        if len(work_type_list) > 0:
+            work_type_list_range = len(work_type_list)
+            print('\nproject time sums')
+            total_duration_int = 0
+            for i in range(0, work_type_list_range):
+                duration_int = work_type_durations_list[i]
+                total_duration_int = total_duration_int + duration_int
+                self.hrs(duration_int)
+                print(work_type_list[i] + ': ' + self.duration_hrs_mins)
+            self.hrs(total_duration_int)
+            print('\ntotal duration for project: ' + self.duration_hrs_mins)
+
+    """
+    print stats
+    """
+    def stats_printer(self, *args):
+
+        #the stats are all created first except for points stats, which are only created when printed
+        # because it takes so long to run. I figure these at the top are more efficient because they would otherwise
+        # run multiple times.
+        self.create_raw_data_for_status()
+        self.create_timesum_stats()
+        self.create_balance_stats()
+        self.create_goal_stats()
+        self.create_base_stats()
+
+        #for when this is needed to loop through
+        timeframe_types = ['this week', 'today']
+
+        #prints initial space then starts going through args for a stats requested
+        print('\n')
+        for arg in args:
+
+            #prints stats created by create_balance_stats()
+            if arg == 'project type balance stats':
+
+                #prints the values for active leisure and work
+                print('\nbalance stats for project types: \n')
+                for timeframe_type in timeframe_types:
+                    project_types = ['active-leisure', 'work']
+                    for project_type in project_types:
+                        if timeframe_type == 'this week':
+                            value_str = str(self.week_project_type_balance_ratings[project_type])
+                        elif timeframe_type == 'today':
+                            value_str = str(self.today_project_type_balance_ratings[project_type])
+                        print(timeframe_type + ' - ' + project_type + ': ' + value_str)
+                    print('\n')
+
+            #prints stats created by create_balance_stats()
+            if arg == 'worktype balance stats':
+
+                #prints values for all worktypes with goals
+                print('\nbalance stats for work-types: \n')
+                for worktype in self.today_worktype_balance_ratings:
+                    value_str = str(self.today_worktype_balance_ratings[worktype])
+                    print('today - ' + worktype + ': ' + value_str)
+                for worktype in self.week_worktype_balance_ratings:
+                    value_str = str(self.week_worktype_balance_ratings[worktype])
+                    print('this week - ' + worktype + ': ' + value_str)
+                print('\n')
+
+            #prints stats created by create_goal_stats()
+            if arg == 'last week day goals':
+
+                #so it can edit the list as it loops through
+                last_week_day_goals = self.last_week_day_goals
+
+                #prints stats for project type
+                print('\nnumber of days work-type-day-goals were achieved for last week:\n')
+                number_of_days = str(last_week_day_goals['active-leisure'])
+                print('project type - active-leisure' + ': ' + number_of_days)
+                last_week_day_goals.pop('active-leisure')
+                number_of_days = str(last_week_day_goals['work'])
+                print('project type - work' + ': ' + number_of_days)
+                last_week_day_goals.pop('work')
+
+                #prints stats for worktype
+                for worktype in last_week_day_goals:
+                    number_of_days = str(last_week_day_goals[worktype])
+                    print(worktype + ': ' + number_of_days)
+
+            #prints stats created by create_goal_stats()
+            if arg == 'last week week goals':
+
+                #this section removes all worktypes from last_week_week_goals that wasn't achieved
+                last_week_week_goals = self.last_week_week_goals
+                for entry in self.worktypes_for_goals:
+                    if entry in last_week_week_goals:
+                        if last_week_week_goals[entry] < self.worktypes_for_goals[entry][1]:
+                            last_week_week_goals.pop(entry)
+                for entry in self.project_types_for_goals:
+                    if last_week_week_goals[entry] < self.project_types_for_goals[entry][1]:
+                        last_week_week_goals.pop(entry)
+
+                #prints the stats for project type
+                print('\nlast week\'s end-of-the-week goals achieved:\n')
+                if 'active-leisure' in last_week_week_goals:
+                    print('project type: active-leisure')
+                    last_week_week_goals.pop('active-leisure')
+                if 'work' in last_week_week_goals:
+                    print('project type: work')
+                    last_week_week_goals.pop('work')
+
+                #prints all worktype goals
+                for entry in last_week_week_goals:
+                    print(entry)
+
+            #prints stats created by create_goal_stats()
+            if arg == 'week goal progress':
+
+
+                #this section populates percent_and_time_for_goaltypes based on timesums from create_timesum_stats()
+                percent_and_time_for_goaltypes = {}
+                for worktype_goal in self.worktypes_for_goals:
+                    if self.worktypes_for_goals[worktype_goal][1] != 0:
+                        if worktype_goal in self.week_goal_timesums:
+                            percent_complete = self.week_goal_timesums[worktype_goal] / self.worktypes_for_goals[worktype_goal][1]
+                            percent_complete = round(percent_complete, 2)
+                            minutes_to_go = self.worktypes_for_goals[worktype_goal][1] - self.week_goal_timesums[worktype_goal]
+                            percent_and_time_for_goaltypes[worktype_goal] = [percent_complete, minutes_to_go]
+                        else:
+                            minutes_to_go = self.worktypes_for_goals[worktype_goal][1]
+                            percent_and_time_for_goaltypes[worktype_goal] = [0, minutes_to_go]
+
+                #this section prints out the percent complete for each worktype
+                print('\ngoal progress for this week:\n')
+                for worktype in percent_and_time_for_goaltypes:
+                    percent_complete = percent_and_time_for_goaltypes[worktype][0]*100
+                    percent_complete = int(percent_complete)
+                    percent_complete_str = str(percent_complete)
+                    try:
+                        percent_complete_str = percent_complete_str[:(percent_complete_str.index('.')+2)]
+                    except:
+                        pass
+                    if percent_and_time_for_goaltypes[worktype][0] >= 1:
+                        minutes_to_go_str = '0'
+                    else:
+                        minutes_to_go_str = str(percent_and_time_for_goaltypes[worktype][1])
+                    print(worktype + ': ' + percent_complete_str + '%' + ' | ' + minutes_to_go_str + ' minutes to go')
+                print('\n')
+
+                #this section populates this_week_project_type_goals with info from create_raw_data_for_status()
+                this_week_project_type_goals = {'active-leisure': 0, 'work': 0}
+                for entry in self.raw_data_for_status:
+                    if entry[0].date() in self.this_week_dtos:
+                        this_week_project_type_goals[entry[3]] = this_week_project_type_goals[entry[3]] + entry[2]
+
+                #this section prints project type goals
+                for entry in this_week_project_type_goals:
+                    percent_complete = this_week_project_type_goals[entry] / self.project_types_for_goals[entry][1]
+                    percent_complete = round(percent_complete, 2)
+                    if percent_complete >= 1:
+                        minutes_left = 0
+                    else:
+                        minutes_left = self.project_types_for_goals[entry][1] - this_week_project_type_goals[entry]
+                    percent_complete = percent_complete * 100
+                    percent_complete = int(percent_complete)
+                    percent_complete = str(percent_complete)
+                    minutes_left = str(minutes_left)
+                    print('project type - ' + entry + ': ' + percent_complete + '%' + ' | ' + minutes_left + ' minutes to go')
+
+            #prints stats created by create_goal_stats()
+            if arg == 'today goal progress':
+
+
+                #populates percent_and_time_for_goaltypes with info
+                percent_and_time_for_goaltypes = {}
+                for worktype_goal in self.worktypes_for_goals:
+                    if self.worktypes_for_goals[worktype_goal][0] != 0:
+                        if worktype_goal in self.day_goal_timesums:
+                            percent_complete = self.day_goal_timesums[worktype_goal] / self.worktypes_for_goals[worktype_goal][0]
+                            percent_complete = round(percent_complete, 2)
+                            minutes_to_go = self.worktypes_for_goals[worktype_goal][0] - self.day_goal_timesums[worktype_goal]
+                            percent_and_time_for_goaltypes[worktype_goal] = [percent_complete, minutes_to_go]
+                        else:
+                            minutes_to_go = self.worktypes_for_goals[worktype_goal][0]
+                            percent_and_time_for_goaltypes[worktype_goal] = [0, minutes_to_go]
+
+                #prints info from percent_and_time_for_goaltypes
+                print('\ngoal progress for today:\n')
+                for worktype in percent_and_time_for_goaltypes:
+                    percent_complete = percent_and_time_for_goaltypes[worktype][0]*100
+                    percent_complete = int(percent_complete)
+                    percent_complete_str = str(percent_complete)
+                    if percent_and_time_for_goaltypes[worktype][0] >= 1:
+                        minutes_to_go_str = '0'
+                    else:
+                        minutes_to_go_str = str(percent_and_time_for_goaltypes[worktype][1])
+                    print(worktype + ': ' + percent_complete_str + '%' + ' | ' + minutes_to_go_str + ' minutes to go')
+                print('\n')
+
+                #populates today_project_type_goals with info
+                today_project_type_goals = {'active-leisure': 0, 'work': 0}
+                for entry in self.raw_data_for_status:
+                    if entry[0].date() == datetime.datetime.now().date():
+                        today_project_type_goals[entry[3]] = today_project_type_goals[entry[3]] + entry[2]
+
+                #prints info from today_project_type_goals
+                for entry in today_project_type_goals:
+                    percent_complete = today_project_type_goals[entry] / self.project_types_for_goals[entry][0]
+                    percent_complete = round(percent_complete, 2)
+                    if percent_complete >= 1:
+                        minutes_left = 0
+                    else:
+                        minutes_left = self.project_types_for_goals[entry][0] - today_project_type_goals[entry]
+                    percent_complete = percent_complete * 100
+                    percent_complete = int(percent_complete)
+                    percent_complete = str(percent_complete)
+                    minutes_left = str(minutes_left)
+                    print('project type - ' + entry + ': ' + percent_complete + '%' + ' | ' + minutes_left + ' minutes to go')
+
+            #prints stats created by create_raw_data_for_status()
+            if arg == 'session stats':
+
+                #session_shifts is created here for all current day sessions
+                self.create_raw_data_for_status()
+
+                #this populates session_shifts with today's shifts
+                session_shifts = []
+                for entry in self.raw_data_for_status:
+                    if entry[0].date() == datetime.datetime.now().date():
+                        session_shifts.append(entry)
+
+                #this sorts based on the datetime objects because they're first in the list
+                sorted_session_shifts = sorted(session_shifts)
+
+                #this prints all entries for today with their shift rating and project type
+                print('\nshifts and ratings for today:\n')
+                for session_shift in session_shifts:
+                    shift_begin = session_shift[0].strftime("%X")
+                    shift_begin = shift_begin[:5]
+                    current_session_rating = session_shift[4][0]
+                    current_session_rating = str(current_session_rating)
+                    session_duration_str = str(session_shift[2])
+                    session_end_time = session_shift[0] + datetime.timedelta(minutes=session_shift[2])
+                    shift_end = session_end_time.strftime('%X')
+                    shift_end = shift_end[:5]
+                    print(session_shift[1] + ' (' + session_shift[3] + ')' + ' - ' + shift_begin \
+                    + ' - ' + shift_end + ' (' + session_duration_str + 'min' + '): ' + 'r = ' + current_session_rating)
+                print('\n')
+
+                #this prints dates and times for all sessions with session rating 6
+                for session_shift in self.raw_data_for_status:
+                    if session_shift[4][0] == 6:
+                        shift_begin = session_shift[0].strftime("%X")
+                        shift_begin = shift_begin[:5]
+                        current_session_rating = session_shift[4][0]
+                        current_session_rating = str(current_session_rating)
+                        print("congrats for completing this " + session_shift[3] + " session on: " + session_shift[0].strftime('%Y/%m/%d') + " | " + shift_begin + "\n")
+
+                #this exception is in case there's no entries for today yet,
+                # which will mean the sorted_session_shifts will be out of range error
+                try:
+                    current_session_time = sorted_session_shifts[-1][4][0] * 20
+                    current_session_time_str = str(current_session_time)
+                    session_end_stamp = sorted_session_shifts[-1][0].strftime("%X")
+                    session_end_stamp = session_end_stamp[:5]
+                    print('current session: ' + current_session_time_str + 'mins')
+                    print('last session end-time: ' + session_end_stamp)
+                except:
+                    print("no session yet today")
+                print("\n")
+
+            #prints stats created by create_timesum_stats()
+            if arg == 'overall stats':
+
+                #prints this week's totals for worktypes and project types
+                print('\nthis week\s totals: ')
+                for x in self.week_timesums:
+                    self.hrs(self.week_timesums[x])
+                    if x:
+                        pass
+                    else:
+                        x = 'none'
+                    print(x + ': ' + self.duration_hrs_mins)
+
+                #prints today's totals for worktypes and project types
+                print('\ntoday\'s totals:\n')
+                for x in self.day_timesums:
+                    self.hrs(self.day_timesums[x])
+                    if x:
+                        pass
+                    else:
+                        x = 'none'
+                    print(x + ': ' + self.duration_hrs_mins)
+
+                #prints the total work times for each day this week
+                print('\ntotal active time by day and ratio for active-leisure/work: \n')
+                for day in self.timesums_by_day:
+                    total = self.timesums_by_day[day][0] + self.timesums_by_day[day][1]
+                    self.hrs(total)
+                    total_str = str(total)
+                    fraction_str = str(self.timesums_by_day[day][0]) + '/' + str(self.timesums_by_day[day][1])
+                    #the try avoids division by 0, in which case it just leaves the fraction as is
+                    try:
+                        fraction_str = Fraction(fraction_str)
+                        fraction_str = str(fraction_str)
+                        if len(fraction_str) == 1:
+                            fraction_str = fraction_str + '/1'
+                    except:
+                        pass
+                    day_str = str(day)
+                    print(day_str + ': ' + self.duration_hrs_mins + ' | ' + fraction_str)
+
+            #prints stats created by create_points_stats()
+            if arg == 'points stats':
+
+
+                #populates the following variables with info from points_dict, and prints all details
+                # from points dict for each shift this week and last week
+                last_week_points_sum = 0
+                this_week_points_sum = 0
+                points_sums_by_day = {}
+                for entry in self.points_dict:
+                    print('\n')
+                    print('{:^15} | {:^15.5} | {:^30}:{:<3} | {:^15}'.format(self.points_dict[entry][0][0].strftime('%Y/%m/%d'),
+                        self.points_dict[entry][0][0].strftime('%X'), self.points_dict[entry][0][1], self.points_dict[entry][0][2],
+                        self.points_dict[entry][0][3]))
+                    print('\n')
+                    for multiplier_str in self.points_dict[entry][1]:
+                        print('{:30}{}'.format(multiplier_str, self.points_dict[entry][1][multiplier_str]))
+                    print('\n')
+                    points_str = str(self.points_dict[entry][2])
+                    print('points: ' + points_str)
+
+                    #this part calculates the sum of points for this week and last week
+                    if self.points_dict[entry][0][0].date() in self.this_week_dtos:
+                        this_week_points_sum = this_week_points_sum + self.points_dict[entry][2]
+                    elif self.points_dict[entry][0][0].date() in self.last_week_dtos:
+                        last_week_points_sum = last_week_points_sum + self.points_dict[entry][2]
+
+                    #This part calculates the sums by day
+                    if self.points_dict[entry][0][0].date() in points_sums_by_day:
+                        points_sums_by_day[self.points_dict[entry][0][0].date()] = \
+                        points_sums_by_day[self.points_dict[entry][0][0].date()] + \
+                        self.points_dict[entry][2]
+                    else:
+                        points_sums_by_day[self.points_dict[entry][0][0].date()] = \
+                        self.points_dict[entry][2]
+
+                if len(self.points_dict) > 1:
+                    #prints sums for this week, last week, and each day
+                    this_week_points_sum = int(this_week_points_sum)
+                    last_week_points_sum = int(last_week_points_sum)
+                    print('\n')
+                    print('last week points sum: {:,}'.format(last_week_points_sum))
+                    print('this week points sum: {:,}'.format(this_week_points_sum))
+                    print('\n')
+                    for day in points_sums_by_day:
+                        points_int = int(points_sums_by_day[day])
+                        day_str = str(day)
+                        print('{}: {:,}'.format(day_str, points_int))
+
+            #prints stats create by create_points_stats()
+            if arg == 'consecutive day stats':
+
+                #ensures this_week_dtos is sorted from earliest to lates
+                self.this_week_dtos = sorted(self.this_week_dtos)
+
+                #populates entries_to_calculate_list with all shifts from today and yesterday.
+                entries_to_calculate_list = []
+                for data_entry in self.raw_data_for_status:
+                    if data_entry[0].date() == self.this_week_dtos[-1]:
+                        entries_to_calculate_list.append(data_entry)
+                    else:
+                        #this checks yesterday first as this_week_dtos[-2],
+                        # I believe it will only fail if it's sunday (only one day in the list)
+                        # in which case last_week_dtos[0] is used because that's saturday.
+                        # I should check this on a Sunday.
+                        try:
+                            if data_entry[0].date() == self.this_week_dtos[-2]:
+                                entries_to_calculate_list.append(data_entry)
+                        except:
+                            if data_entry[0].date() == self.last_week_dtos[0]:
+                                entries_to_calculate_list.append(data_entry)
+                entries_to_calculate_list = sorted(entries_to_calculate_list)
+
+                #this creates a list of worktypes with goals where the day goal isn't 0
+                worktype_consecutive_day_ratings = {}
+                for worktype in self.worktypes_for_goals:
+                    if self.worktypes_for_goals[worktype][0] != 0:
+                        worktype_consecutive_day_ratings[worktype] = 1
+
+
+                #this reverse checks entries_to_calculate_list (most recent first) for the first instance of
+                # each worktype with a day goal for the most recent consecutive day rating
+                index = -1
+                keep_checking = True
+                checked_worktypes_list = []
+                while keep_checking == True:
+                    try:
+                        simple_worktype = entries_to_calculate_list[index][1].split()[0]
+                        if simple_worktype in worktype_consecutive_day_ratings and \
+                        simple_worktype not in checked_worktypes_list:
+                            worktype_consecutive_day_ratings[simple_worktype] = \
+                            entries_to_calculate_list[index][5][0]
+                            checked_worktypes_list.append(simple_worktype)
+
+                        index = index - 1
+                        if index < -(len(entries_to_calculate_list)):
+                            keep_checking = False
+                    except:
+                        #this is to bypass the problem of list index out of range when entries_to_calculate_list
+                        # has no entries (i.e. no work has been completed yet today)
+                        break
+
+                #prints the consecutive day ratings for each worktype
+                print('\nconsecutive day ratings for each worktype\n')
+                for worktype in worktype_consecutive_day_ratings:
+                    consecutive_day_rating_for_print = str(worktype_consecutive_day_ratings[worktype])
+                    print('{:25}: {}'.format(worktype, consecutive_day_rating_for_print))
+                print('\n')
+
+            #prints the notes from the project spread sheet notes column
+            if arg == 'info diary':
+
+                wb = load_workbook(filename=self.filename)
+                sheet = wb.active
+
+                self.length(sheet)
+
+                for i in range(5, self.sheet_length):
+
+                    #this gets the notes from the spread sheet
+                    info_diary_str = sheet.cell(row=i, column=4).value
+                    #has to be more than one character for it to bother printing
+                    if info_diary_str:
+
+                        #this is used for printing. I give it a value for the type() check for a datetime object below
+                        data_entry_list = [0]
+
+                        #it attempts to use the date to find the entry in raw_data_for_status
+                        date_index = sheet.cell(row=i, column=2).value
+                        for data_entry in self.raw_data_for_status:
+                            if data_entry[0] == date_index:
+                                data_entry_list = data_entry
+
+                        #checks to see if it got an entry from raw_data_for_status,
+                        # and if not adds info to data_entry_list from the spread sheet instead
+                        if type(data_entry_list[0]) != datetime.datetime:
+                            data_entry_list = [sheet.cell(row=i, column=2).value, sheet.cell(row=i, column=3).value, \
+                            sheet.cell(row=i, column=3).value]
+
+                        #prints a title bar with shift-info, then the notes
+                        print('{:^15} | {:^15.5} | {:^30}: | {:<3}minutes'.format(data_entry_list[0].strftime('%Y/%m/%d'),
+                            data_entry_list[0].strftime('%X'), data_entry_list[1], data_entry_list[2],))
+                        print('\n')
+                        print(info_diary_str)
+                        print('\n')
+
+            #prints all stats for today
+            if arg == 'today stats':
+
+                self.create_points_stats(1)
+                self.stats_printer('points stats')
+                self.stats_printer('consecutive day stats')
+
+                print('\nbalance stats for project types today: \n')
+                project_types = ['active-leisure', 'work']
+                for project_type in project_types:
+                    value_str = str(self.today_project_type_balance_ratings[project_type])
+                    print(project_type + ': ' + value_str)
+
+                print('\nbalance stats for work-types today: \n')
+                for worktype in self.today_worktype_balance_ratings:
+                    value_str = str(self.today_worktype_balance_ratings[worktype])
+                    print(worktype + ': ' + value_str)
+
+                self.stats_printer('today goal progress')
+
+                #this populates session_shifts with today's shifts
+                session_shifts = []
+                for entry in self.raw_data_for_status:
+                    if entry[0].date() == datetime.datetime.now().date():
+                        session_shifts.append(entry)
+
+                #this sorts based on the datetime objects because they're first in the list
+                sorted_session_shifts = sorted(session_shifts)
+
+                #this prints all entries for today with their shift rating and project type
+                print('\nshifts and ratings for today:\n')
+                for session_shift in session_shifts:
+                    shift_begin = session_shift[0].strftime("%X")
+                    shift_begin = shift_begin[:5]
+                    current_session_rating = session_shift[4][0]
+                    current_session_rating = str(current_session_rating)
+                    session_duration_str = str(session_shift[2])
+                    session_end_time = session_shift[0] + datetime.timedelta(minutes=session_shift[2])
+                    shift_end = session_end_time.strftime('%X')
+                    shift_end = shift_end[:5]
+                    print(session_shift[1] + ' (' + session_shift[3] + ')' + ' - ' + shift_begin \
+                    + ' - ' + shift_end + ' (' + session_duration_str + 'min' + '): ' + 'r = ' + current_session_rating)
+                print('\n')
+
+                print('\ntoday\'s totals: \n')
+                for x in self.day_timesums:
+                    self.hrs(self.day_timesums[x])
+                    if x:
+                        pass
+                    else:
+                        x = 'none'
+                    print(x + ': ' + self.duration_hrs_mins)
+
+                print('\n')
+                for worktype in self.week_goal_timesums:
+                    if worktype == 'active-leisure' or worktype == 'work':
+                        if self.week_goal_timesums[worktype] >= self.project_types_for_goals[worktype][1]:
+                            print('\ncongratulations on accomplishing this week\'s goal for: ' + worktype)
+                    else:
+                        if self.week_goal_timesums[worktype] >= self.worktypes_for_goals[worktype][1]:
+                            print('\ncongratulations on accomplishing this week\'s goal for: ' + worktype)
+                for worktype in self.day_goal_timesums:
+                    if worktype == 'active-leisure' or worktype == 'work':
+                        if self.day_goal_timesums[worktype] >= self.project_types_for_goals[worktype][0]:
+                            print('\ncongratulations on accomplishing today\'s goal for: ' + worktype)
+                    else:
+                        if self.day_goal_timesums[worktype] >= self.worktypes_for_goals[worktype][0]:
+                            print('\ncongratulations on accomplishing today\'s goal for: ' + worktype)
+                print('\n')
+
+            #prints flagged notes, meant to test for new functionality
+            if arg == 'goal notes':
+
+                wb = load_workbook(filename=self.filename)
+                sheet = wb.active
+
+                self.length(sheet)
+
+                notes_to_scan_list = []
+                notes_to_print_list = []
+
+                for i in range(5, self.sheet_length):
+
+                    notes_to_scan_list.append(sheet.cell(row=i, column=4).value)
+
+                for note in notes_to_scan_list:
+                    try:
+                        note_list = note.split(' ][ ')
+                    except:
+                        note_list = [note]
+                    for note_item in note_list:
+                        if note_item == None:
+                            pass
+                        elif 'goal note: ' in note_item:
+                            strip_index = note_item.find('goal note: ')
+                            print_note = note_item[(strip_index+11):]
+                            if print_note[-1] == ']':
+                                print_note = print_note[:-2]
+                            print_note = print_note.strip()
+                            print_note = print_note.lower()
+                            notes_to_print_list.append(print_note)
+                        elif 'goal note remove: ' in note_item:
+                            strip_index = note_item.find('goal note remove: ')
+                            print_note = note_item[(strip_index+18):]
+                            if print_note[-1] == ']':
+                                print_note = print_note[:-2]
+                            print_note = print_note.lower()
+                            print_note = print_note.strip()
+                            if print_note in notes_to_print_list:
+                                notes_to_print_list.pop(notes_to_print_list.index(print_note))
+
+
+
+                print('\ngoal notes: \n')
+                for goal_note in notes_to_print_list:
+                    print(goal_note)
+                print('\n')
+
+    """
+    this method gets run as a separate thread. It's initiated by runtime_options().
+    runtime_options() also intiates the Queues clock_on and runtime_switch_queue,
+    which controls the clock. countdown_clock_type tells the method if it's a work
+    session or break session. This method runs alarm_play() once session run out.
+    """
+
+    def countdown_clock(self, clock_on, runtime_switch_queue, countdown_clock_type):
+
+        if countdown_clock_type == 'work':
+            duration_for_clock = self.workminutes
+            session_type = "work timer: "
+        if countdown_clock_type == 'break':
+            duration_for_clock = self.breakminutes
+            session_type = "break timer: "
+
+        if type(duration_for_clock) == int:
+            end_time = self.shift_start_time + datetime.timedelta(minutes=duration_for_clock)
+            #this queue is initiated in runtime_options()
+            switch = runtime_switch_queue.get()
+            timer_str = "00:00"
+            second_measure = end_time - datetime.datetime.now()
+            second_count = second_measure.seconds
+            print_time = clock_on.get()
+            print('\n')
+            #switch is either changed by runtime_options() sending a queue (see below) or by the session timing out
+            while switch == False:
+
+                if datetime.datetime.now() < end_time:
+                    #this next section creates a string of the current remaining minutes/seconds
+                    clock_second_count = datetime.timedelta(seconds=second_count)
+                    while datetime.datetime.now() < (end_time - clock_second_count):
+                        pass
+                    timer_seconds = end_time - datetime.datetime.now()
+                    minutes = timer_seconds.seconds // 60
+                    seconds = timer_seconds.seconds - (minutes*60)
+                    if seconds < 10:
+                        seconds_str = "0" + str(seconds)
+                    else:
+                        seconds_str = str(seconds)
+                    if minutes < 10:
+                        minutes_str = "0" + str(minutes)
+                    else:
+                        minutes_str = str(minutes)
+                    timer_str = session_type + minutes_str + ":" + seconds_str
+                    #checking to see if runtime_options() is stopping the clock
+                    #from printing by providing False throught his queue
+                    if clock_on.empty() == False:
+                        print_time = clock_on.get()
+                    if print_time == True:
+                        print('\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n')
+                        print(timer_str)
+                    second_count = (second_count - 1)
+                    #checking to see if runtime_options() is stopping the clock by providing True through this queue
+                    if runtime_switch_queue.empty() == False:
+                        switch = runtime_switch_queue.get()
+
+                #this else is for when datetime.now is greater than end time, i.e. the session ends
+                else:
+
+                    print('\n\npress enter to continue...')
+
+                    switch = True
+
+            if datetime.datetime.now() >= end_time:
+                if countdown_clock_type == 'work':
+                    self.alarm_play('work')
+                if countdown_clock_type == 'break':
+                    self.alarm_play('break')
+
+
+    """
+    This method runs a continuous loop which creates the lwt session.
+    If work and break time are set to 'run', it runs the session here,
+    but if they're times for countdown then this method runs runtime_options()
+
+    """
+
+    def work(self):
+
+        while True:
+
+            print("\nhit enter to start work timer")
+            input()
+
+            #setting the startime for work session
+            self.shift_start_time = datetime.datetime.now()
+
+            if self.workminutes == "run":
+
+                timer_str_print = self.shift_start_time.strftime("%H:%M")
+                timer_str_print = "work-shift start time: " + timer_str_print
+                print(timer_str_print)
+                work_session_running = True
+                while work_session_running == True:
+                    print('\noptions: \n1) session and consecutive day stats',
+                    '\n2) goal stats \n3) balance stats \n4) timesums and project stats \n5) points'
+                    '\n6) today\'s stats \n7) info diary')
+                    option_select = input()
+                    if option_select == '1':
+                        print('\n')
+                        self.stats_printer('consecutive day stats')
+                        self.stats_printer('session stats')
+                    elif option_select == '2':
+                        print('\n')
+                        self.stats_printer('last week day goals')
+                        self.stats_printer('last week week goals')
+                        self.stats_printer('week goal progress')
+                        self.stats_printer('today goal progress')
+                    elif option_select == '3':
+                        print('\n')
+                        self.stats_printer('worktype balance stats')
+                        self.stats_printer('project type balance stats')
+                    elif option_select == '4':
+                        print('\n')
+                        self.project_stats()
+                        self.stats_printer('overall stats')
+                    elif option_select == '5':
+                        print('\n')
+                        self.create_points_stats('print')
+                    elif option_select == '6':
+                        print('\n')
+                        self.stats_printer('today stats')
+                    elif option_select == '7':
+                        print('\n')
+                        self.info_diary_input()
+                    else:
+                        work_session_running = False
+                work_run_duration = datetime.datetime.now() - self.shift_start_time
+                work_run_duration = work_run_duration.seconds // 60
+                self.entry_work_duration = self.entry_work_duration + work_run_duration
+
+            #if self.workminutes == int
+            else:
+
+                self.runtime_options('work')
+
+            self.entry()
+
+            print('\ncongratulations on completing a session for: ' + self.entry_work_type)
+
+            if self.reset_info == True:
+                print('\nre-set the work and break times...\n')
+                self.info_set()
+                self.reset_info = False
+
+            #setting the startime for break session
+            self.shift_start_time = datetime.datetime.now()
+
+            if self.breakminutes == "run":
+
+                timer_str_print = self.shift_start_time.strftime("%H:%M")
+                timer_str_print = "break start time: " + timer_str_print
+                print(timer_str_print)
+                work_session_running = True
+                while work_session_running == True:
+                    print('\noptions: \n1) session and consecutive day stats',
+                    '\n2) goal stats \n3) balance stats \n4) timesums and project stats \n5) points'
+                    '\n6) today\'s stats \n7) info diary')
+                    option_select = input()
+                    if option_select == '1':
+                        print('\n')
+                        self.stats_printer('consecutive day stats')
+                        self.stats_printer('session stats')
+                    elif option_select == '2':
+                        print('\n')
+                        self.stats_printer('last week day goals')
+                        self.stats_printer('last week week goals')
+                        self.stats_printer('week goal progress')
+                        self.stats_printer('today goal progress')
+                    elif option_select == '3':
+                        print('\n')
+                        self.stats_printer('worktype balance stats')
+                        self.stats_printer('project type balance stats')
+                    elif option_select == '4':
+                        print('\n')
+                        self.project_stats()
+                        self.stats_printer('overall stats')
+                    elif option_select == '5':
+                        print('\n')
+                        self.create_points_stats('print')
+                    elif option_select == '6':
+                        print('\n')
+                        self.stats_printer('today stats')
+                    elif option_select == '7':
+                        print('\n')
+                        self.info_diary_input()
+                    else:
+                        work_session_running = False
+                work_run_duration = datetime.datetime.now() - self.shift_start_time
+                work_run_duration = work_run_duration.seconds // 60
+                self.entry_work_duration = self.entry_work_duration + work_run_duration
+
+            #if self.breakminutes == int
+            else:
+
+                self.runtime_options('break')
+
+    """
+    runtime_options is initiated by work(), taking either 'work' or 'break' as an argument.
+    This method starts a separate thread for running and printing the clock while.
+    After starting the separate thread, it opens input() for printing stats or switch options.
+    Once this method is done for work-sessions, work() moves onto entry,
+    and for break sessions it work() loops back to start.
+
+    """
+
+    def runtime_options(self, *args):
+
+        #the following que will stop the timer loop (while switch == False) in countdown_clock()
+        runtime_switch_queue = Queue()
+        runtime_switch_queue.put(False)
+        #the following que will stop the clock from printing, but without ending the timer session
+        clock_on = Queue()
+        clock_on.put(True)
+        if 'work' in args:
+            countdown_clock_type = 'work'
+            #this countdown_clock() thread simply runs and prints the clock and plays the alarm
+            work_message = Process(target=self.countdown_clock, args = (clock_on, runtime_switch_queue, countdown_clock_type))
+            work_message.start()
+            end_session = False
+
+            """
+
+            project_stats()
+            """
+
+            while end_session == False:
+                input()
+                #the options change depending on if end_time has passed or not, if it has the only option is to exit the loop
+                end_time = self.shift_start_time + datetime.timedelta(minutes=self.workminutes)
+                if datetime.datetime.now() < (end_time):
+                    clock_on.put(False)
+                    time.sleep(2)
+                    print('\noptions: \n1) Go to break timer (full-time) \n2) Go to break timer (real-time)',
+                    ' \n3) Switch to run-time \n4) session and consecutive day stats',
+                    '\n5) goal stats \n6) balance stats \n7) timesums and project stats \n8) points'
+                    '\n9) today\'s stats \n10) info diary')
+                    option_select = input()
+                    if option_select == '1':
+                        runtime_switch_queue.put(True)
+                        end_session = True
+                    elif option_select == '2':
+                        real_minutes = datetime.datetime.now() - self.shift_start_time
+                        real_minutes = real_minutes.seconds // 60
+                        minutes_to_subtract = self.workminutes - real_minutes
+                        self.entry_work_duration = self.entry_work_duration - minutes_to_subtract - self.breakminutes
+                        self.reset_info = True
+                        runtime_switch_queue.put(True)
+                        end_session = True
+                    elif option_select == '3':
+                        real_minutes = datetime.datetime.now() - self.shift_start_time
+                        real_minutes = real_minutes.seconds // 60
+                        minutes_to_subtract = self.workminutes - real_minutes
+                        self.entry_work_duration = self.entry_work_duration - minutes_to_subtract - self.breakminutes
+                        self.workminutes = 'run'
+                        runtime_switch_queue.put(True)
+                        end_session = True
+                        self.work()
+                    elif option_select == '4':
+                        print('\n')
+                        self.stats_printer('consecutive day stats')
+                        self.stats_printer('session stats')
+                        print('\nhit return to continue clock...')
+                        input()
+                        clock_on.put(True)
+                    elif option_select == '5':
+                        print('\n')
+                        self.stats_printer('last week day goals')
+                        self.stats_printer('last week week goals')
+                        self.stats_printer('week goal progress')
+                        self.stats_printer('today goal progress')
+                        print('\nhit return to continue clock...')
+                        input()
+                        clock_on.put(True)
+                    elif option_select == '6':
+                        print('\n')
+                        self.stats_printer('worktype balance stats')
+                        self.stats_printer('project type balance stats')
+                        print('\nhit return to continue clock...')
+                        input()
+                        clock_on.put(True)
+                    elif option_select == '7':
+                        print('\n')
+                        self.project_stats()
+                        self.stats_printer('overall stats')
+                        print('\nhit return to continue clock...')
+                        input()
+                        clock_on.put(True)
+                    elif option_select == '8':
+                        print('\n')
+                        self.create_points_stats('print')
+                        print('\nhit return to continue clock...')
+                        input()
+                        clock_on.put(True)
+                    elif option_select == '9':
+                        print('\n')
+                        self.stats_printer('today stats')
+                        print('\nhit return to continue clock...')
+                        input()
+                        clock_on.put(True)
+                    elif option_select == '10':
+                        print('\n')
+                        self.info_diary_input()
+                        clock_on.put(True)
+                    else:
+                        end_session = True
+                else:
+                    end_session = True
+
+        elif 'break' in args:
+            countdown_clock_type = 'break'
+            break_message = Process(target=self.countdown_clock, args = (clock_on, runtime_switch_queue, countdown_clock_type))
+            break_message.start()
+            end_session = False
+            while end_session == False:
+                input()
+                end_time = self.shift_start_time + datetime.timedelta(minutes=self.breakminutes)
+                if datetime.datetime.now() < (end_time):
+                    clock_on.put(False)
+                    time.sleep(2)
+                    print('\noptions: \n1) session and consecutive day stats',
+                    '\n2) goal stats \n3) balance stats \n4) timesums and project stats \n5) points'
+                    '\n6) today\'s stats \n7) info diary')
+                    option_select = input()
+                    if option_select == '1':
+                        print('\n')
+                        self.stats_printer('consecutive day stats')
+                        self.stats_printer('session stats')
+                        print('\nhit return to continue clock...')
+                        input()
+                        clock_on.put(True)
+                    elif option_select == '2':
+                        print('\n')
+                        self.stats_printer('last week day goals')
+                        self.stats_printer('last week week goals')
+                        self.stats_printer('week goal progress')
+                        self.stats_printer('today goal progress')
+                        print('\nhit return to continue clock...')
+                        input()
+                        clock_on.put(True)
+                    elif option_select == '3':
+                        print('\n')
+                        self.stats_printer('worktype balance stats')
+                        self.stats_printer('project type balance stats')
+                        print('\nhit return to continue clock...')
+                        input()
+                        clock_on.put(True)
+                    elif option_select == '4':
+                        print('\n')
+                        self.project_stats()
+                        self.stats_printer('overall stats')
+                        print('\nhit return to continue clock...')
+                        input()
+                        clock_on.put(True)
+                    elif option_select == '5':
+                        print('\n')
+                        self.create_points_stats('print')
+                        print('\nhit return to continue clock...')
+                        input()
+                        clock_on.put(True)
+                    elif option_select == '6':
+                        print('\n')
+                        self.stats_printer('today stats')
+                        print('\nhit return to continue clock...')
+                        input()
+                        clock_on.put(True)
+                    elif option_select == '7':
+                        print('\n')
+                        self.info_diary_input()
+                        clock_on.put(True)
+                else:
+                    end_session = True
+
+    """
+    this is selected options in work() and runtime_options(). It saves notes to
+    self.entry_info_diary_notes, which gets saved to project spreadsheets at the end of the shift-work
+    """
+
+    def info_diary_input(self):
+
+        #prints info diary entries for the project
+        self.stats_printer('info diary')
+
+        #this is to print the grateful and compassion message
+        message_number = datetime.datetime.now().second%10
+        happy_message = ''
+        if message_number in range(0,3):
+            print('\nI\'m grateful for: ')
+            grateful_str = input()
+            happy_message = 'It\'s good to be grateful for ' + grateful_str
+
+        #prints the notes to be saved
+        print('\nnotes to be saved at end of shift-work:\n')
+        print(self.entry_info_diary_notes)
+        print('\n')
+
+        #prints the goal notes
+        self.stats_printer('goal notes')
+
+        #this is for the while loop below
+        input_session_on = True
+
+        #takes the input and saves it to entry_info_diary_notes
+        print('\n')
+        print('\nenter notes (to exit enter \'exit\', to erase the last unsaved note enter \'erase\'):\n')
+        print(happy_message)
+        print('\n')
+        while input_session_on == True:
+            notes_str = input()
+            if notes_str == 'exit':
+                input_session_on = False
+            elif notes_str == 'erase':
+                #rfind will search from the end of the string and give back the index
+                erase_index = self.entry_info_diary_notes.rfind(' ][ ')
+                if erase_index == -1:
+                    self.entry_info_diary_notes = ''
+                else:
+                    self.entry_info_diary_notes = self.entry_info_diary_notes[:erase_index+2]
+                print('\nnotes to be saved at end of shift-work:\n')
+                print(self.entry_info_diary_notes)
+                print('\n')
+                #prints the goal notes
+                self.stats_printer('goal notes')
+                print('\nenter notes (to exit enter \'exit\', to erase the last unsaved note enter \'erase\'):\n')
+                print(happy_message)
+                print('\n')
+            else:
+                self.entry_info_diary_notes = self.entry_info_diary_notes + '[ ' + notes_str + ' ]'
