@@ -4,7 +4,8 @@ The following article will become the basis of an experiment on the Python progr
 
 Visit https://pressureoflight.ca/ to learn about and support my work!
 
-Title: Why teaching a computer to remember computing is the first step to constructing consciousness in AI
+**
+Title: Why teaching a computer to remember computing is the first step to constructing consciousness in AI**
 
 Because "The Pressure of Light: how consciousness creates permanence in a universe of infinite-heterogeneity" contributes to an understanding of consciousness, and because it's both helpful and fashionable to consider all meaningful theories regarding consciousness in the light of artificial intelligence, I'm writing this exposition of how The Pressure of Light transfers into programming consciousness for AI (https://pressureoflight.ca/). 
 
